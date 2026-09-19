@@ -29,7 +29,7 @@ import { randomBytes, createHash } from 'crypto';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
-import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { matchesAllowedUser, parseAllowedUsers, parseAllowedGroups, isChatAllowed } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 
@@ -90,6 +90,49 @@ try {
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+// ── NEXAR ALLOWLIST PATCH (do not remove; auto-re-applied by the
+//    whatsapp-allowlist-selfheal gateway:startup hook after `hermes update`) ──
+// Chat-scoped allowlist: only these group JIDs and the dedicated DM sender(s)
+// are ever read, queued, stored, logged, or written to. Everything else is
+// dropped at the bridge — the earliest possible point. The dedicated DM var
+// avoids colliding with the gateway's WHATSAPP_ALLOWED_USERS (which the Python
+// authz layer applies to group senders too). See allowlist.js.
+// Source of truth is ~/.hermes/whatsapp-allowlist.json ({groups:[], dm_users:[]}).
+// A file (not env vars) because the gateway only forwards a fixed hardcoded set
+// of WHATSAPP_* env vars to this bridge — new env vars silently never arrive.
+// The file lives outside the git checkout, so it survives `hermes update`.
+// Falls back to env vars if the file is absent.
+function _loadChatAllowlistFile() {
+  // HERMES_HOME may be the *profile* dir (…/.hermes/profiles/<name>), so probe
+  // the profile dir, the derived base ~/.hermes, and $HOME/.hermes.
+  const cands = [];
+  const hh = process.env.HERMES_HOME;
+  if (hh) {
+    cands.push(path.join(hh, 'whatsapp-allowlist.json'));
+    const m = hh.match(/^(.*)[/\\]profiles[/\\][^/\\]+[/\\]?$/);
+    if (m) cands.push(path.join(m[1], 'whatsapp-allowlist.json'));
+  }
+  if (process.env.HOME) cands.push(path.join(process.env.HOME, '.hermes', 'whatsapp-allowlist.json'));
+  for (const p of cands) {
+    try { if (existsSync(p)) return JSON.parse(readFileSync(p, 'utf8')) || {}; } catch { /* try next */ }
+  }
+  return {};
+}
+const _AL = _loadChatAllowlistFile();
+const _asCsv = (v) => Array.isArray(v) ? v.join(',') : (v || '');
+const ALLOWED_GROUPS = parseAllowedGroups(
+  _asCsv(_AL.groups) || process.env.WHATSAPP_ALLOWED_GROUPS || ''
+);
+const _rawDmUsers = _asCsv(_AL.dm_users)
+  || process.env.WHATSAPP_ALLOWED_DM_USERS
+  || (process.env.WHATSAPP_ALLOWED_USERS === '*' ? '' : (process.env.WHATSAPP_ALLOWED_USERS || ''));
+const ALLOWED_DM_USERS = parseAllowedUsers(_rawDmUsers);
+const CHAT_ALLOWLIST_OPTS = () => ({
+  allowedGroups: ALLOWED_GROUPS,
+  allowedUsers: ALLOWED_DM_USERS,
+  sessionDir: SESSION_DIR,
+});
+// ── END NEXAR ALLOWLIST PATCH ──
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
@@ -343,7 +386,7 @@ async function startSocket() {
             fromMe: true,
             fromOwnerEnabled: FORWARD_OWNER_MESSAGES,
             recentlySent: recentlySentIds,
-            allowlistMatches: (id) => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
+            allowlistMatches: (id) => isChatAllowed(id, null, CHAT_ALLOWLIST_OPTS()), // NEXAR ALLOWLIST PATCH: chat-scoped owner gate
             messageId: msg.key.id,
             chatId,
           });
@@ -391,13 +434,14 @@ async function startSocket() {
           } catch {}
           continue;
         }
-        if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+        // NEXAR ALLOWLIST PATCH: groups gated by JID, DMs by dedicated sender
+        // list. Non-approved chats dropped here — never queued/read/stored.
+        // Log intentionally omits chatId/senderId (no PII).
+        if (!isChatAllowed(chatId, senderId, CHAT_ALLOWLIST_OPTS())) {
           try {
             console.log(JSON.stringify({
               event: 'ignored',
-              reason: 'allowlist_mismatch',
-              chatId,
-              senderId,
+              reason: isGroup ? 'group_not_allowlisted' : 'dm_not_allowlisted',
             }));
           } catch {}
           continue;
@@ -597,6 +641,10 @@ app.post('/send', async (req, res) => {
   if (!chatId || !message) {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
+  // NEXAR ALLOWLIST PATCH: Hal may only write to approved chats.
+  if (!isChatAllowed(chatId, null, CHAT_ALLOWLIST_OPTS())) {
+    return res.status(403).json({ error: 'chat not in allowlist' });
+  }
 
   try {
     const chunks = splitLongMessage(formatOutgoingMessage(message));
@@ -629,6 +677,10 @@ app.post('/edit', async (req, res) => {
   const { chatId, messageId, message } = req.body;
   if (!chatId || !messageId || !message) {
     return res.status(400).json({ error: 'chatId, messageId, and message are required' });
+  }
+  // NEXAR ALLOWLIST PATCH: Hal may only write to approved chats.
+  if (!isChatAllowed(chatId, null, CHAT_ALLOWLIST_OPTS())) {
+    return res.status(403).json({ error: 'chat not in allowlist' });
   }
 
   try {
@@ -682,6 +734,10 @@ app.post('/send-media', async (req, res) => {
   const { chatId, filePath, mediaType, caption, fileName } = req.body;
   if (!chatId || !filePath) {
     return res.status(400).json({ error: 'chatId and filePath are required' });
+  }
+  // NEXAR ALLOWLIST PATCH: Hal may only write to approved chats.
+  if (!isChatAllowed(chatId, null, CHAT_ALLOWLIST_OPTS())) {
+    return res.status(403).json({ error: 'chat not in allowlist' });
   }
 
   try {
@@ -756,6 +812,10 @@ app.post('/typing', async (req, res) => {
 
   const { chatId } = req.body;
   if (!chatId) return res.status(400).json({ error: 'chatId required' });
+  // NEXAR ALLOWLIST PATCH: no typing indicators to non-approved chats.
+  if (!isChatAllowed(chatId, null, CHAT_ALLOWLIST_OPTS())) {
+    return res.status(403).json({ error: 'chat not in allowlist' });
+  }
 
   try {
     await sock.sendPresenceUpdate('composing', chatId);
@@ -811,8 +871,9 @@ if (PAIR_ONLY) {
   app.listen(PORT, '127.0.0.1', () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
-    if (ALLOWED_USERS.size > 0) {
-      console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
+    if (ALLOWED_DM_USERS.size > 0 || ALLOWED_GROUPS.size > 0) {
+      // NEXAR ALLOWLIST PATCH: log counts only, never numbers/JIDs (no PII).
+      console.log(`🔒 Chat allowlist active: ${ALLOWED_DM_USERS.size} DM sender(s), ${ALLOWED_GROUPS.size} group(s). All other chats dropped.`);
     } else if (WHATSAPP_MODE === 'self-chat') {
       console.log(`🔒 Self-chat mode — only your own messages to yourself are processed.`);
     } else {

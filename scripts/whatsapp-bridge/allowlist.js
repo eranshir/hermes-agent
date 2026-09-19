@@ -63,6 +63,33 @@ export function expandWhatsAppIdentifiers(identifier, sessionDir) {
   return resolved;
 }
 
+export function parseAllowedGroups(rawValue) {
+  // Group JIDs (…@g.us) are matched verbatim (case-insensitive, trimmed).
+  return new Set(
+    String(rawValue || '')
+      .split(',')
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter(Boolean)
+  );
+}
+
+// Unified chat-scoped allowlist used for BOTH inbound gating and outbound
+// (/send etc.).  Groups are allowed by their chat JID (any participant may
+// speak in an approved group); DMs are allowed only when the counterparty
+// number is in the sender allowlist (empty = deny, secure default).  For
+// outbound calls senderId is unknown, so the DM counterparty is chatId.
+export function isChatAllowed(chatId, senderId, { allowedGroups, allowedUsers, sessionDir } = {}) {
+  const cid = String(chatId || '');
+  if (!cid) return false;
+  if (cid.endsWith('@g.us')) {
+    if (!allowedGroups || allowedGroups.size === 0) return false;
+    return allowedGroups.has('*') || allowedGroups.has(cid.toLowerCase());
+  }
+  // Direct message (or status/broadcast, which will fail the user match).
+  const peer = senderId || cid;
+  return matchesAllowedUser(peer, allowedUsers, sessionDir);
+}
+
 export function matchesAllowedUser(senderId, allowedUsers, sessionDir) {
   // Empty allowlist = NO ONE allowed (secure default, #8389).  Operators
   // who want an open bot must set ``WHATSAPP_ALLOWED_USERS=*`` explicitly.
