@@ -233,3 +233,33 @@ def test_memory_review_prompt_still_focused_on_user_facts():
     assert "skills_list" not in prompt
     assert "SURVEY" not in prompt
     assert "memory tool" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Patch-anchor hygiene guidance (self-improve candidate: curator-patch-friction)
+# ---------------------------------------------------------------------------
+
+def _assert_patch_anchor_hygiene(prompt, label):
+    lower = prompt.lower()
+    assert "patch-anchor hygiene" in lower, (
+        f"{label}: must carry patch-anchor hygiene guidance"
+    )
+    assert "verbatim" in lower, (
+        f"{label}: must tell the reviewer to copy old_string verbatim from disk"
+    )
+    assert "widen the anchor" in lower, (
+        f"{label}: must tell the reviewer to widen the anchor on a refusal"
+    )
+    assert "whitespace-only old_string" in lower, (
+        f"{label}: must forbid a whitespace-only old_string anchor"
+    )
+
+
+def test_skill_review_prompt_has_patch_anchor_hygiene():
+    """_SKILL_REVIEW_PROMPT must steer patch anchors to be unique + verbatim."""
+    _assert_patch_anchor_hygiene(AIAgent._SKILL_REVIEW_PROMPT, "_SKILL_REVIEW_PROMPT")
+
+
+def test_combined_review_prompt_has_patch_anchor_hygiene():
+    """_COMBINED_REVIEW_PROMPT drives skill patches too — same guidance applies."""
+    _assert_patch_anchor_hygiene(AIAgent._COMBINED_REVIEW_PROMPT, "_COMBINED_REVIEW_PROMPT")
